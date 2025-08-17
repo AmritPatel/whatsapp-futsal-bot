@@ -28,7 +28,7 @@ const AUTH   = { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } };
  *   { mode: 'random'|'snake'|'snake_order',
  *     players: string[]                         // random or snake_order
  *            | {name:string, rating:number}[],  // snake (rated)
- *     reversed?: boolean                        // used for snake/snake_order to vary next shuffle
+ *     lastKey?: string                          // composition signature of last reply
  *   }
  */
 const lastRosterByUser = new Map();
@@ -48,6 +48,12 @@ function formatTeamsBlocks(teams) {
     return `${header}\n${body}`;
   });
   return `Teams for tonight:\n\n${blocks.join('\n\n')}\n\nHave fun! ⚽`;
+}
+
+// Generate a composition signature ignoring within-team order, to detect "same teams"
+function teamKey(teams) {
+  const sortedTeams = teams.map(t => t.slice().sort((a,b)=>a.localeCompare(b)));
+  return JSON.stringify(sortedTeams);
 }
 
 // ---------- Helpers: sending ----------
@@ -94,14 +100,45 @@ function makeTeamsRandom(players15) {
   return [s.slice(0, 5), s.slice(5, 10), s.slice(10, 15)];
 }
 
-function makeTeamsSnake(sortedStrongToWeakNames) {
-  // Draft order across 15 picks: A,B,C, C,B,A, A,B,C, C,B,A, A,B,C
-  const order = [0,1,2, 2,1,0, 0,1,2, 2,1,0, 0,1,2];
+// Build a snake order with a random start team and optional reversed first round.
+// startTeam in {0,1,2}; reverseFirstRound boolean.
+function buildSnakeOrder(startTeam = 0, reverseFirstRound = false) {
+  const rounds = 5;
+  const order = [];
+  for (let r = 0; r < rounds; r++) {
+    const forward = (r % 2 === 0) ^ reverseFirstRound ? 1 : 0; // XOR
+    const seq = forward ? [0,1,2] : [2,1,0];
+    for (const t of seq) {
+      order.push((t + startTeam) % 3);
+    }
+  }
+  return order;
+}
+
+function makeTeamsSnakeWithOrder(sortedStrongToWeakNames, startTeam = 0, reverseFirstRound = false) {
+  const order = buildSnakeOrder(startTeam, reverseFirstRound);
   const out = [[], [], []];
   for (let i = 0; i < 15; i++) {
     out[order[i]].push(sortedStrongToWeakNames[i]);
   }
   return out;
+}
+
+// Try multiple different snake orders until the composition differs from prevKey
+function makeDifferentSnakeTeams(sortedNames, prevKey) {
+  const tries = 12;
+  for (let k = 0; k < tries; k++) {
+    const startTeam = Math.floor(Math.random() * 3);    // 0,1,2
+    const reverseFirst = Math.random() < 0.5;           // true/false
+    const teams = makeTeamsSnakeWithOrder(sortedNames, startTeam, reverseFirst);
+    const key = teamKey(teams);
+    if (key !== prevKey) return { teams, key };
+  }
+  // Fallback: even if same (very unlikely), return last attempt
+  const startTeam = Math.floor(Math.random() * 3);
+  const reverseFirst = Math.random() < 0.5;
+  const teams = makeTeamsSnakeWithOrder(sortedNames, startTeam, reverseFirst);
+  return { teams, key: teamKey(teams) };
 }
 
 // ---------- Helpers: parsing ----------
@@ -250,6 +287,7 @@ app.post('/webhook', async (req, res) => {
           // --- Button clicks (interactive) ---
           if (type === 'interactive' && msg.interactive?.type === 'button_reply') {
             const clicked = msg.interactive.button_reply?.id;
+
             if (clicked === 'shuffle') {
               const prior = lastRosterByUser.get(from);
               if (!prior) {
@@ -260,31 +298,29 @@ app.post('/webhook', async (req, res) => {
                 );
                 continue;
               }
+
               if (prior.mode === 'random') {
                 const teams = makeTeamsRandom(prior.players);
-                await sendText(from, formatTeamsBlocks(teams));
-                await sendButtons(from);
-              } else if (prior.mode === 'snake') {
-                prior.reversed = !prior.reversed;
-                const list = prior.reversed
-                  ? prior.players.slice().reverse().map(p => p.name)
-                  : prior.players.map(p => p.name);
-                const teams = makeTeamsSnake(list);
+                prior.lastKey = teamKey(teams);
                 lastRosterByUser.set(from, prior);
                 await sendText(from, formatTeamsBlocks(teams));
                 await sendButtons(from);
-              } else if (prior.mode === 'snake_order') {
-                prior.reversed = !prior.reversed;
-                const list = prior.reversed
-                  ? prior.players.slice().reverse()
-                  : prior.players.slice();
-                const teams = makeTeamsSnake(list);
-                lastRosterByUser.set(from, prior);
-                await sendText(from, formatTeamsBlocks(teams));
-                await sendButtons(from);
+                continue;
               }
+
+              // Snake variants: always produce a NEW composition
+              const baseNames = prior.mode === 'snake'
+                ? prior.players.map(p => p.name)
+                : prior.players.slice(); // snake_order
+
+              const attempt = makeDifferentSnakeTeams(baseNames, prior.lastKey || '');
+              prior.lastKey = attempt.key;
+              lastRosterByUser.set(from, prior);
+              await sendText(from, formatTeamsBlocks(attempt.teams));
+              await sendButtons(from);
               continue;
             }
+
             if (clicked === 'help') {
               await sendText(from,
                 `Send exactly 15 players. Examples:\n\n` +
@@ -312,8 +348,12 @@ app.post('/webhook', async (req, res) => {
                 continue;
               }
               const namesSorted = roster.players.map(p => p.name); // already strong->weak
-              lastRosterByUser.set(from, { mode: 'snake', players: roster.players.slice(), reversed: false });
-              const teams = makeTeamsSnake(namesSorted);
+              const teams = makeTeamsSnakeWithOrder(namesSorted, 0, false);
+              lastRosterByUser.set(from, {
+                mode: 'snake',
+                players: roster.players.slice(),
+                lastKey: teamKey(teams),
+              });
               await sendText(from, formatTeamsBlocks(teams));
               await sendButtons(from);
               continue;
@@ -327,8 +367,12 @@ app.post('/webhook', async (req, res) => {
                 );
                 continue;
               }
-              lastRosterByUser.set(from, { mode: 'snake_order', players: roster.players.slice(), reversed: false });
-              const teams = makeTeamsSnake(roster.players);
+              const teams = makeTeamsSnakeWithOrder(roster.players, 0, false);
+              lastRosterByUser.set(from, {
+                mode: 'snake_order',
+                players: roster.players.slice(),
+                lastKey: teamKey(teams),
+              });
               await sendText(from, formatTeamsBlocks(teams));
               await sendButtons(from);
               continue;
@@ -337,8 +381,12 @@ app.post('/webhook', async (req, res) => {
             // random mode
             const names = roster.players;
             if (names.length === 15) {
-              lastRosterByUser.set(from, { mode: 'random', players: names.slice() });
               const teams = makeTeamsRandom(names);
+              lastRosterByUser.set(from, {
+                mode: 'random',
+                players: names.slice(),
+                lastKey: teamKey(teams),
+              });
               await sendText(from, formatTeamsBlocks(teams));
               await sendButtons(from);
             } else {
