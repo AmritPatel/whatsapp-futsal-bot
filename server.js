@@ -1,5 +1,7 @@
 // server.js
-// WhatsApp Futsal Bot — 3x5 team balancer with buttons + snake draft (ratings or ranked order) + balanced initial + non-repeating shuffles
+// WhatsApp Futsal Bot — 3x5 team balancer with buttons + snake draft
+// Features: random mode, snake (rated or ranked), vertical color blocks, buttons,
+// balanced initial snake, non-repeating balanced shuffles with tier/tie shuffling.
 // Env required: VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
 // Optional: GRAPH_API_VERSION (defaults to v21.0), PORT
 
@@ -27,7 +29,7 @@ const AUTH   = { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } };
  * lastRosterByUser maps sender E.164 digits ->
  *   { mode: 'random'|'snake'|'snake_order',
  *     players: string[]                         // random or snake_order
- *            | {name:string, rating:number}[],  // snake (rated)
+ *            | {name:string, rating:number}[],  // snake (rated), DESC by rating
  *     lastKey?: string,                         // last composition signature
  *     seenKeys?: Set<string>                    // all compositions sent for this roster
  *   }
@@ -52,7 +54,6 @@ function formatTeamsBlocks(teams) {
 }
 
 // Generate a composition signature that is invariant to within-team order AND team color order.
-// That way, swapping colors (e.g., rotating start team) doesn't count as "new teams".
 function teamKey(teams) {
   const teamStrings = teams
     .map(t => t.slice().sort((a,b)=>a.localeCompare(b)).join('|'));
@@ -142,28 +143,70 @@ function balanceScore(teams, ratingMap) {
   return { spread, variance, sums };
 }
 
-// Generate the six possible snake compositions and choose the best-balanced one
-// that hasn't been used yet (based on seenKeys). If all used, clear seen and return best.
-function chooseBalancedSnakeTeams(sortedNames, ratingMap, seenKeys) {
-  const candidates = [];
+// ---- Tier / tie shuffling to change compositions while keeping balance ----
+
+// Shuffle within equal-rating groups (rated snake)
+function shuffleWithinEqualRatings(ratedPlayersDesc) {
+  // ratedPlayersDesc: [{name, rating}] sorted DESC by rating
+  const out = [];
+  let i = 0;
+  while (i < ratedPlayersDesc.length) {
+    const r = ratedPlayersDesc[i].rating;
+    const group = [];
+    while (i < ratedPlayersDesc.length && ratedPlayersDesc[i].rating === r) {
+      group.push(ratedPlayersDesc[i]);
+      i++;
+    }
+    // shuffle names inside equal-rating group
+    const g = shuffle(group);
+    out.push(...g);
+  }
+  return out;
+}
+
+// Shuffle within fixed tiers of size 3 (ranked snake or no ties)
+// tiers: [0..2], [3..5], [6..8], [9..11], [12..14]
+function tierShuffleNames(names) {
+  const out = [];
+  for (let i = 0; i < 15; i += 3) {
+    const chunk = names.slice(i, i + 3);
+    out.push(...shuffle(chunk));
+  }
+  return out;
+}
+
+// Choose the best-balanced snake among all start/direction combos for given order
+function bestBalancedSnakeForOrder(sortedNames, ratingMap) {
+  let best = null;
   for (let startTeam = 0; startTeam < 3; startTeam++) {
     for (const reverseFirst of [false, true]) {
       const teams = makeTeamsSnakeWithOrder(sortedNames, startTeam, reverseFirst);
       const key = teamKey(teams);
       const { spread, variance, sums } = balanceScore(teams, ratingMap);
-      candidates.push({ teams, key, spread, variance, sums, startTeam, reverseFirst });
+      const cand = { teams, key, spread, variance, sums, startTeam, reverseFirst };
+      if (!best || cand.spread < best.spread || (cand.spread === best.spread && cand.variance < best.variance)) {
+        best = cand;
+      }
     }
   }
-  // Sort by spread ASC, then variance ASC
-  candidates.sort((a,b) => (a.spread - b.spread) || (a.variance - b.variance));
+  return best;
+}
 
-  // Prefer an unseen candidate
-  const unseen = candidates.find(c => !seenKeys.has(c.key));
-  if (unseen) return unseen;
+// Find a new, balanced composition not seen before by perturbing order (ties/tiers) then picking best snake
+function chooseNewBalancedSnake(sortedNamesBase, ratingMap, seenKeys, attempts = 60) {
+  for (let a = 0; a < attempts; a++) {
+    let candidateOrder = sortedNamesBase;
 
-  // If everything is seen, reset and return the best overall
-  seenKeys.clear();
-  return candidates[0];
+    // 50% chance to perturb the order
+    if (Math.random() < 0.5) {
+      candidateOrder = tierShuffleNames(candidateOrder);
+    }
+
+    const best = bestBalancedSnakeForOrder(candidateOrder, ratingMap);
+    if (!seenKeys.has(best.key)) return best;
+  }
+  // If all attempts failed (unlikely), return the best for base order (may repeat)
+  return bestBalancedSnakeForOrder(sortedNamesBase, ratingMap);
 }
 
 // ---------- Helpers: parsing ----------
@@ -327,7 +370,7 @@ app.post('/webhook', async (req, res) => {
               if (prior.mode === 'random') {
                 const teams = makeTeamsRandom(prior.players);
                 prior.lastKey = teamKey(teams);
-                prior.seenKeys = prior.seenKeys || new Set();
+                prior.seenKeys = prior.seenKeys || new Set([prior.lastKey]);
                 prior.seenKeys.add(prior.lastKey);
                 lastRosterByUser.set(from, prior);
                 await sendText(from, formatTeamsBlocks(teams));
@@ -335,20 +378,24 @@ app.post('/webhook', async (req, res) => {
                 continue;
               }
 
-              // Snake variants: choose a NEW, more balanced composition
-              // Build rating map: true ratings for 'snake', synthetic for 'snake_order' (15..1)
-              let sortedNames, ratingMap;
+              // Snake variants: choose a NEW, balanced composition via tier/tie shuffling
+              let sortedNamesBase, ratingMap;
               if (prior.mode === 'snake') {
-                sortedNames = prior.players.map(p => p.name);
+                sortedNamesBase = prior.players.map(p => p.name); // already DESC by rating
                 ratingMap = new Map(prior.players.map((p) => [p.name, p.rating]));
+                // Try to shuffle within equal-rating groups first to change compositions
+                if (Math.random() < 0.7) {
+                  const shuffledWithinTies = shuffleWithinEqualRatings(prior.players);
+                  sortedNamesBase = shuffledWithinTies.map(p => p.name);
+                }
               } else {
                 // snake_order: assign synthetic ratings 15..1 (strong->weak)
-                sortedNames = prior.players.slice();
-                ratingMap = new Map(sortedNames.map((n, i) => [n, 15 - i]));
+                sortedNamesBase = prior.players.slice();
+                ratingMap = new Map(sortedNamesBase.map((n, i) => [n, 15 - i]));
               }
 
               prior.seenKeys = prior.seenKeys || new Set();
-              const choice = chooseBalancedSnakeTeams(sortedNames, ratingMap, prior.seenKeys);
+              const choice = chooseNewBalancedSnake(sortedNamesBase, ratingMap, prior.seenKeys, 80);
               prior.lastKey = choice.key;
               prior.seenKeys.add(choice.key);
               lastRosterByUser.set(from, prior);
@@ -383,13 +430,13 @@ app.post('/webhook', async (req, res) => {
                 );
                 continue;
               }
-              const namesSorted = roster.players.map(p => p.name); // already strong->weak
+              const namesSorted = roster.players.map(p => p.name); // strong->weak
               const ratingMap = new Map(roster.players.map((p) => [p.name, p.rating]));
               // First reply: choose balanced composition already
-              const choice = chooseBalancedSnakeTeams(namesSorted, ratingMap, new Set());
+              const choice = bestBalancedSnakeForOrder(namesSorted, ratingMap);
               lastRosterByUser.set(from, {
                 mode: 'snake',
-                players: roster.players.slice(),
+                players: roster.players.slice(), // keep ratings
                 lastKey: choice.key,
                 seenKeys: new Set([choice.key]),
               });
@@ -408,7 +455,7 @@ app.post('/webhook', async (req, res) => {
               }
               const namesSorted = roster.players.slice();
               const ratingMap = new Map(namesSorted.map((n, i) => [n, 15 - i])); // synthetic ratings
-              const choice = chooseBalancedSnakeTeams(namesSorted, ratingMap, new Set());
+              const choice = bestBalancedSnakeForOrder(namesSorted, ratingMap);
               lastRosterByUser.set(from, {
                 mode: 'snake_order',
                 players: namesSorted,
