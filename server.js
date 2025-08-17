@@ -1,7 +1,8 @@
 // server.js
 // WhatsApp Futsal Bot — 3x5 team balancer with buttons + snake draft
 // Features: random mode, snake (rated or ranked), vertical color blocks, buttons,
-// balanced initial snake, non-repeating balanced shuffles with tier/tie shuffling.
+// balanced initial snake, non-repeating balanced shuffles with tier/tie shuffling,
+// and visible team rating totals for snake modes.
 // Env required: VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
 // Optional: GRAPH_API_VERSION (defaults to v21.0), PORT
 
@@ -43,12 +44,13 @@ const COLORS = [
   { name: 'RED',    emoji: '🔴' }, // Team C
 ];
 
-function formatTeamsBlocks(teams) {
+function formatTeamsBlocks(teams, totals) {
   // teams = [ [5 names], [5 names], [5 names] ]
   const blocks = teams.map((t, i) => {
     const header = `${COLORS[i].emoji}  ${COLORS[i].name}`;
     const body   = t.map(n => `• ${n}`).join('\n');
-    return `${header}\n${body}`;
+    const tail   = Array.isArray(totals) ? `\nTotal: ${totals[i]}` : '';
+    return `${header}\n${body}${tail}`;
   });
   return `Teams for tonight:\n\n${blocks.join('\n\n')}\n\nHave fun! ⚽`;
 }
@@ -157,8 +159,7 @@ function shuffleWithinEqualRatings(ratedPlayersDesc) {
       group.push(ratedPlayersDesc[i]);
       i++;
     }
-    // shuffle names inside equal-rating group
-    const g = shuffle(group);
+    const g = shuffle(group); // shuffle names inside equal-rating group
     out.push(...g);
   }
   return out;
@@ -399,7 +400,8 @@ app.post('/webhook', async (req, res) => {
               prior.lastKey = choice.key;
               prior.seenKeys.add(choice.key);
               lastRosterByUser.set(from, prior);
-              await sendText(from, formatTeamsBlocks(choice.teams));
+              const totals = computeTeamSums(choice.teams, ratingMap);
+              await sendText(from, formatTeamsBlocks(choice.teams, totals));
               await sendButtons(from);
               continue;
             }
@@ -440,7 +442,8 @@ app.post('/webhook', async (req, res) => {
                 lastKey: choice.key,
                 seenKeys: new Set([choice.key]),
               });
-              await sendText(from, formatTeamsBlocks(choice.teams));
+              const totals = computeTeamSums(choice.teams, ratingMap);
+              await sendText(from, formatTeamsBlocks(choice.teams, totals));
               await sendButtons(from);
               continue;
             }
@@ -462,7 +465,8 @@ app.post('/webhook', async (req, res) => {
                 lastKey: choice.key,
                 seenKeys: new Set([choice.key]),
               });
-              await sendText(from, formatTeamsBlocks(choice.teams));
+              const totals = computeTeamSums(choice.teams, ratingMap);
+              await sendText(from, formatTeamsBlocks(choice.teams, totals));
               await sendButtons(from);
               continue;
             }
