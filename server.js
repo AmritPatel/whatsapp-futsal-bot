@@ -2,9 +2,9 @@
 // WhatsApp Futsal Bot — 3x5 team balancer with buttons + snake draft
 // Features: random mode, snake (rated or ranked), vertical color blocks, buttons,
 // balanced initial snake, non-repeating balanced shuffles with tier/tie shuffling,
-// and visible team rating totals for snake modes.
+// and optional team rating totals (via SHOW_TOTALS env switch).
 // Env required: VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
-// Optional: GRAPH_API_VERSION (defaults to v21.0), PORT
+// Optional: GRAPH_API_VERSION (defaults to v21.0), PORT, SHOW_TOTALS (default '1' → show)
 
 const express = require('express');
 const axios = require('axios');
@@ -17,6 +17,7 @@ const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v21.0';
 const PHONE_NUMBER_ID   = process.env.PHONE_NUMBER_ID;
 const WHATSAPP_TOKEN    = process.env.WHATSAPP_TOKEN;
 const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
+const SHOW_TOTALS       = (process.env.SHOW_TOTALS ?? '1') === '1';
 
 if (!PHONE_NUMBER_ID || !WHATSAPP_TOKEN || !VERIFY_TOKEN) {
   console.warn('[WARN] Missing one or more env vars: PHONE_NUMBER_ID, WHATSAPP_TOKEN, VERIFY_TOKEN');
@@ -400,7 +401,7 @@ app.post('/webhook', async (req, res) => {
               prior.lastKey = choice.key;
               prior.seenKeys.add(choice.key);
               lastRosterByUser.set(from, prior);
-              const totals = computeTeamSums(choice.teams, ratingMap);
+              const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
               await sendText(from, formatTeamsBlocks(choice.teams, totals));
               await sendButtons(from);
               continue;
@@ -442,7 +443,7 @@ app.post('/webhook', async (req, res) => {
                 lastKey: choice.key,
                 seenKeys: new Set([choice.key]),
               });
-              const totals = computeTeamSums(choice.teams, ratingMap);
+              const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
               await sendText(from, formatTeamsBlocks(choice.teams, totals));
               await sendButtons(from);
               continue;
@@ -465,7 +466,7 @@ app.post('/webhook', async (req, res) => {
                 lastKey: choice.key,
                 seenKeys: new Set([choice.key]),
               });
-              const totals = computeTeamSums(choice.teams, ratingMap);
+              const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
               await sendText(from, formatTeamsBlocks(choice.teams, totals));
               await sendButtons(from);
               continue;
