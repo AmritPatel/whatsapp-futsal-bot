@@ -1,13 +1,23 @@
 // server.js
-// WhatsApp Futsal Bot — 3x5 team balancer with buttons + snake draft
-// Features: random mode, snake (rated or ranked), vertical color blocks, buttons,
-// balanced initial snake, non-repeating balanced shuffles with tier/tie shuffling,
-// and optional team rating totals (via SHOW_TOTALS env switch).
+// WhatsApp Futsal Bot — 3x5 team balancer + snake draft + Bibs tracker
+// Features:
+// - random mode, snake (rated or ranked)
+// - vertical color blocks + buttons
+// - balanced initial snake + non-repeating balanced shuffles (tier/tie shuffling)
+// - team rating totals toggle via SHOW_TOTALS env
+// - Bibs tracker:
+//     * Mark who actually took bibs last session by adding the word "bibs" anywhere on their line
+//     * Track counts across sessions in a local JSON file
+//     * On team post, show "Bibs next: <least so far among the 15> (tie→random; avoids repeating last washer)"
+//     * Command "bibs_history" prints compact frequency chart (only people who have taken bibs)
+//
 // Env required: VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
-// Optional: GRAPH_API_VERSION (defaults to v21.0), PORT, SHOW_TOTALS (default '1' → show)
+// Optional: GRAPH_API_VERSION (defaults to v21.0), PORT, SHOW_TOTALS (default '1' → show), BIBS_FILE
 
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -26,6 +36,9 @@ if (!PHONE_NUMBER_ID || !WHATSAPP_TOKEN || !VERIFY_TOKEN) {
 const WA_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PHONE_NUMBER_ID}/messages`;
 const AUTH   = { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } };
 
+// Idempotency: avoid double-incrementing bibs on webhook retries
+const processedMessageIds = new Set();
+
 // ---------- Tiny memory for "Shuffle again" ----------
 /**
  * lastRosterByUser maps sender E.164 digits ->
@@ -33,10 +46,66 @@ const AUTH   = { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } };
  *     players: string[]                         // random or snake_order
  *            | {name:string, rating:number}[],  // snake (rated), DESC by rating
  *     lastKey?: string,                         // last composition signature
- *     seenKeys?: Set<string>                    // all compositions sent for this roster
+ *     seenKeys?: Set<string>,                   // all compositions sent for this roster
+ *     bibsNext?: string,                        // cached assignment for next wash (stable across shuffles)
+ *     ratingMap?: Map<string, number>           // for totals rendering on shuffles
  *   }
  */
 const lastRosterByUser = new Map();
+
+// ---------- Bibs store ----------
+const BIBS_FILE = process.env.BIBS_FILE || path.join(process.cwd(), 'bibs.json');
+
+function normalizeNameKey(name) {
+  if (!name) return '';
+  const lower = name.toLowerCase();
+  const decomp = lower.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return decomp.trim();
+}
+
+function readStore() {
+  try {
+    if (!fs.existsSync(BIBS_FILE)) return {};
+    const raw = fs.readFileSync(BIBS_FILE, 'utf8');
+    const data = JSON.parse(raw || '{}');
+    return (data && typeof data === 'object') ? data : {};
+  } catch (e) {
+    console.error('[BIBS] load error:', e);
+    return {};
+  }
+}
+function writeStore(obj) {
+  try {
+    fs.writeFileSync(BIBS_FILE, JSON.stringify(obj, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[BIBS] save error:', e);
+  }
+}
+function incBibsCount(name) {
+  const store = readStore();
+  const key = normalizeNameKey(name);
+  // Only increment when the washer CHANGES from the last recorded washer.
+  if (store.__lastWasher === key) {
+    return store[key] || 0;
+  }
+  store[key] = (store[key] || 0) + 1;
+  store.__lastWasher = key; // remember last actual washer
+  writeStore(store);
+  return store[key];
+}
+function getBibsCount(name) {
+  const store = readStore();
+  const key = normalizeNameKey(name);
+  return store[key] || 0;
+}
+function getBibsEntries() {
+  const store = readStore();
+  return Object.entries(store).filter(([k,_]) => !k.startsWith('__')); // [ [key, count], ... ]
+}
+function getLastWasherKey() {
+  const store = readStore();
+  return store.__lastWasher || null;
+}
 
 // ---------- Helpers: team formatting ----------
 const COLORS = [
@@ -45,22 +114,23 @@ const COLORS = [
   { name: 'RED',    emoji: '🔴' }, // Team C
 ];
 
-function formatTeamsBlocks(teams, totals) {
-  // teams = [ [5 names], [5 names], [5 names] ]
+function formatTeamsBlocks(teams, totals, bibsNext, bibsTakenNote) {
   const blocks = teams.map((t, i) => {
     const header = `${COLORS[i].emoji}  ${COLORS[i].name}`;
     const body   = t.map(n => `• ${n}`).join('\n');
     const tail   = Array.isArray(totals) ? `\nTotal: ${totals[i]}` : '';
     return `${header}\n${body}${tail}`;
   });
-  return `Teams for tonight:\n\n${blocks.join('\n\n')}\n\nHave fun! ⚽`;
+  const bibsLine = bibsNext ? `\n🧼 Bibs next: ${bibsNext}` : '';
+  const takenLine = bibsTakenNote ? `\n✅ Recorded: ${bibsTakenNote}` : '';
+  return `Teams for tonight:\n\n${blocks.join('\n\n')}${bibsLine}${takenLine}\n\nHave fun! ⚽`;
 }
 
-// Generate a composition signature that is invariant to within-team order AND team color order.
+// Composition signature invariant to within-team order AND color assignment.
 function teamKey(teams) {
   const teamStrings = teams
     .map(t => t.slice().sort((a,b)=>a.localeCompare(b)).join('|'));
-  teamStrings.sort(); // ignore which color got which set
+  teamStrings.sort();
   return teamStrings.join('||');
 }
 
@@ -86,6 +156,7 @@ async function sendButtons(to) {
       action: {
         buttons: [
           { type: 'reply', reply: { id: 'shuffle', title: 'Shuffle again' } },
+          { type: 'reply', reply: { id: 'bibs_history', title: 'Bibs history' } },
           { type: 'reply', reply: { id: 'help',    title: 'Help' } }
         ]
       }
@@ -109,12 +180,10 @@ function makeTeamsRandom(players15) {
 }
 
 // Build a snake order with a chosen start team and optional reversed first round.
-// startTeam in {0,1,2}; reverseFirstRound boolean.
 function buildSnakeOrder(startTeam = 0, reverseFirstRound = false) {
   const rounds = 5;
   const order = [];
   for (let r = 0; r < rounds; r++) {
-    // if forward === true, round order is A,B,C; else C,B,A
     const forward = ((r % 2) === 0) ^ reverseFirstRound ? 1 : 0; // XOR
     const seq = forward ? [0,1,2] : [2,1,0];
     for (const t of seq) order.push((t + startTeam) % 3);
@@ -140,17 +209,13 @@ function balanceScore(teams, ratingMap) {
   const maxSum = Math.max(...sums);
   const minSum = Math.min(...sums);
   const spread = maxSum - minSum;
-  // tiebreaker: variance of sums
   const mean = (sums[0] + sums[1] + sums[2]) / 3;
   const variance = sums.reduce((acc, s) => acc + (s - mean) ** 2, 0) / 3;
   return { spread, variance, sums };
 }
 
 // ---- Tier / tie shuffling to change compositions while keeping balance ----
-
-// Shuffle within equal-rating groups (rated snake)
 function shuffleWithinEqualRatings(ratedPlayersDesc) {
-  // ratedPlayersDesc: [{name, rating}] sorted DESC by rating
   const out = [];
   let i = 0;
   while (i < ratedPlayersDesc.length) {
@@ -160,14 +225,11 @@ function shuffleWithinEqualRatings(ratedPlayersDesc) {
       group.push(ratedPlayersDesc[i]);
       i++;
     }
-    const g = shuffle(group); // shuffle names inside equal-rating group
+    const g = shuffle(group);
     out.push(...g);
   }
   return out;
 }
-
-// Shuffle within fixed tiers of size 3 (ranked snake or no ties)
-// tiers: [0..2], [3..5], [6..8], [9..11], [12..14]
 function tierShuffleNames(names) {
   const out = [];
   for (let i = 0; i < 15; i += 3) {
@@ -176,8 +238,6 @@ function tierShuffleNames(names) {
   }
   return out;
 }
-
-// Choose the best-balanced snake among all start/direction combos for given order
 function bestBalancedSnakeForOrder(sortedNames, ratingMap) {
   let best = null;
   for (let startTeam = 0; startTeam < 3; startTeam++) {
@@ -193,21 +253,13 @@ function bestBalancedSnakeForOrder(sortedNames, ratingMap) {
   }
   return best;
 }
-
-// Find a new, balanced composition not seen before by perturbing order (ties/tiers) then picking best snake
 function chooseNewBalancedSnake(sortedNamesBase, ratingMap, seenKeys, attempts = 60) {
   for (let a = 0; a < attempts; a++) {
     let candidateOrder = sortedNamesBase;
-
-    // 50% chance to perturb the order
-    if (Math.random() < 0.5) {
-      candidateOrder = tierShuffleNames(candidateOrder);
-    }
-
+    if (Math.random() < 0.5) candidateOrder = tierShuffleNames(candidateOrder);
     const best = bestBalancedSnakeForOrder(candidateOrder, ratingMap);
     if (!seenKeys.has(best.key)) return best;
   }
-  // If all attempts failed (unlikely), return the best for base order (may repeat)
   return bestBalancedSnakeForOrder(sortedNamesBase, ratingMap);
 }
 
@@ -219,43 +271,35 @@ function chooseNewBalancedSnake(sortedNamesBase, ratingMap, seenKeys, attempts =
  *  - snake roster (ranked), using order only after "snake:" prefix (no ratings)
  *
  * Returns:
- *  { mode: 'random', players: string[] }
+ *  { mode: 'random', players: string[], bibsTagged: string[] }
  *  OR
- *  { mode: 'snake', players: {name:string, rating:number}[] }       // sorted strong->weak
+ *  { mode: 'snake', players: {name:string, rating:number}[], bibsTagged: string[] }
  *  OR
- *  { mode: 'snake_order', players: string[] }                       // order is strongest->weakest
+ *  { mode: 'snake_order', players: string[], bibsTagged: string[] }
  */
 function parseRoster(raw) {
-  if (!raw) return { mode: 'random', players: [] };
+  if (!raw) return { mode: 'random', players: [], bibsTagged: [] };
 
-  // Normalize zero-width & punctuation
   let text = raw
     .replace(/[\u200B-\u200D\u2060]/g, '') // zero-widths
     .replace(/\r/g, '')
     .trim();
 
   let forcedSnake = false;
-
-  // Accept "snake:" or "snake draft:" prefixes (multiline capture)
   const snakePrefix = text.match(/^snake(?:\s*draft)?\s*:\s*([\s\S]+)$/i);
   if (snakePrefix) {
     forcedSnake = true;
     text = snakePrefix[1];
   }
 
-  // Case A: "teams: a, b, c, ..." (also allow multiline after colon)
   const teamsColon = text.match(/^teams?\s*:\s*([\s\S]+)$/i);
   if (teamsColon) {
     const payload = teamsColon[1];
-    // split by comma first; if only one item, fall back to newline split
     let items = payload.split(',').map(s => s.trim()).filter(Boolean);
-    if (items.length === 1) {
-      items = payload.split('\n').map(s => s.trim()).filter(Boolean);
-    }
+    if (items.length === 1) items = payload.split('\n').map(s => s.trim()).filter(Boolean);
     return buildRosterFromItems(items, forcedSnake);
   }
 
-  // Case B: Pasted signup list with numbers/notes per line
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   return buildRosterFromItems(lines, forcedSnake);
 }
@@ -263,52 +307,52 @@ function parseRoster(raw) {
 function buildRosterFromItems(items, forcedSnake) {
   const plainNames = [];
   const rated = [];
+  const bibsTagged = [];
 
   for (let raw of items) {
     let line = raw.trim();
     if (!line) continue;
+    const hasBibs = /\bbibs\b/i.test(line);
     // strip leading numbering like "1.", "10 -", "3) ", "11) - "
     line = line.replace(/^\s*\d{1,3}\s*[\.\)\-:]?\s*/, '');
-    // remove trailing/inline notes like "(Bibs)"
-    line = line.replace(/\((?:[^()]*)\)/g, '');
+    // remove anything in parentheses (e.g., "(bibs)"), then remove standalone 'bibs' tokens
+    line = line.replace(/\((?:[^()]*)\)/gi, ' ');
+    line = line.replace(/\bbibs\b/gi, ' ');
     // collapse multiple spaces
     line = line.replace(/\s{2,}/g, ' ').trim();
 
-    // detect trailing rating without parentheses, e.g. "Rajesh 9" or "Juan 10"
     const ratingMatch = line.match(/^(.+?)\s+(\d{1,2})$/);
     if (ratingMatch) {
       const candidateName = cleanName(ratingMatch[1]);
       const rating = parseInt(ratingMatch[2], 10);
       if (candidateName && isFinite(rating)) {
         rated.push({ name: candidateName, rating });
+        if (hasBibs) bibsTagged.push(candidateName);
       }
     } else {
-      const n = cleanName(line); // keep numeric-only names like "97"
-      if (n) plainNames.push(n);
+      const n = cleanName(line);
+      if (n) {
+        plainNames.push(n);
+        if (hasBibs) bibsTagged.push(n);
+      }
     }
   }
 
-  // If every item had a rating => rated snake
   if (rated.length === items.length && rated.length > 0) {
-    rated.sort((a, b) => b.rating - a.rating); // strong->weak
-    return { mode: 'snake', players: rated };
+    rated.sort((a, b) => b.rating - a.rating);
+    return { mode: 'snake', players: rated, bibsTagged };
   }
 
-  // If user forced snake but gave only ranked names => use order as ranking
   if (forcedSnake && rated.length === 0 && plainNames.length === 15) {
-    return { mode: 'snake_order', players: plainNames };
+    return { mode: 'snake_order', players: plainNames, bibsTagged };
   }
 
-  // Default: random list of names
-  return { mode: 'random', players: plainNames };
+  return { mode: 'random', players: plainNames, bibsTagged };
 }
 
 function cleanName(s) {
   if (!s) return '';
-  let t = s
-    .replace(/^[\W_]+|[\W_]+$/g, '')   // trim non-word at ends
-    .replace(/\s{2,}/g, ' ')
-    .trim();
+  let t = s.replace(/^[\W_]+|[\W_]+$/g, '').replace(/\s{2,}/g, ' ').trim();
   return t;
 }
 
@@ -333,7 +377,6 @@ app.get('/webhook', (req, res) => {
 
 // ---------- Webhook: receive ----------
 app.post('/webhook', async (req, res) => {
-  // Always 200 quickly to acknowledge delivery
   res.sendStatus(200);
 
   try {
@@ -345,16 +388,13 @@ app.post('/webhook', async (req, res) => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const v = change.value || {};
-
-        // Handle only messages here
         const messages = v.messages || [];
         if (!messages.length) continue;
 
         for (const msg of messages) {
-          const from = msg.from; // sender E.164 digits
+          const from = msg.from;
           const type = msg.type;
 
-          // --- Button clicks (interactive) ---
           if (type === 'interactive' && msg.interactive?.type === 'button_reply') {
             const clicked = msg.interactive.button_reply?.id;
 
@@ -364,7 +404,8 @@ app.post('/webhook', async (req, res) => {
                 await sendText(from,
                   `I don't have a saved 15-player roster yet.\n\nSend:\n` +
                   `teams: Alice, Bob, … (15 names)\n—or— paste your signup list.\n\n` +
-                  `For snake: "snake: Rajesh 9, Anish 8, …" or "snake:" with ranked lines.`
+                  `For snake: "snake: Rajesh 9, Anish 8, …" or "snake:" with ranked lines.\n` +
+                  `Add the word "bibs" on the line of whoever washed last time to record it.`
                 );
                 continue;
               }
@@ -375,23 +416,20 @@ app.post('/webhook', async (req, res) => {
                 prior.seenKeys = prior.seenKeys || new Set([prior.lastKey]);
                 prior.seenKeys.add(prior.lastKey);
                 lastRosterByUser.set(from, prior);
-                await sendText(from, formatTeamsBlocks(teams));
+                await sendText(from, formatTeamsBlocks(teams, undefined, prior.bibsNext, null));
                 await sendButtons(from);
                 continue;
               }
 
-              // Snake variants: choose a NEW, balanced composition via tier/tie shuffling
               let sortedNamesBase, ratingMap;
               if (prior.mode === 'snake') {
-                sortedNamesBase = prior.players.map(p => p.name); // already DESC by rating
+                sortedNamesBase = prior.players.map(p => p.name);
                 ratingMap = new Map(prior.players.map((p) => [p.name, p.rating]));
-                // Try to shuffle within equal-rating groups first to change compositions
                 if (Math.random() < 0.7) {
                   const shuffledWithinTies = shuffleWithinEqualRatings(prior.players);
                   sortedNamesBase = shuffledWithinTies.map(p => p.name);
                 }
               } else {
-                // snake_order: assign synthetic ratings 15..1 (strong->weak)
                 sortedNamesBase = prior.players.slice();
                 ratingMap = new Map(sortedNamesBase.map((n, i) => [n, 15 - i]));
               }
@@ -402,8 +440,14 @@ app.post('/webhook', async (req, res) => {
               prior.seenKeys.add(choice.key);
               lastRosterByUser.set(from, prior);
               const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
-              await sendText(from, formatTeamsBlocks(choice.teams, totals));
+              await sendText(from, formatTeamsBlocks(choice.teams, totals, prior.bibsNext, null));
               await sendButtons(from);
+              continue;
+            }
+
+            if (clicked === 'bibs_history') {
+              const chart = renderBibsHistory();
+              await sendText(from, chart);
               continue;
             }
 
@@ -413,17 +457,43 @@ app.post('/webhook', async (req, res) => {
                 `• Random: teams: Alice, Bob, Carlos, Diego, Eva, Faisal, Gita, Hasan, Irene, Jack, Kai, Luca, Mina, Noor, Omar\n` +
                 `• Rated snake (no parentheses): snake: Rajesh 9, Anish 8, Juan 8, Kunal 7, 97 7, Sam 7, ...\n` +
                 `• Ranked snake (no ratings, order strongest→weakest):\n` +
-                `  snake:\n  1.Rajesh\n  2.Anish\n  3.Juan\n  ...\n  15.Nami`
+                `  snake:\n  1.Rajesh\n  2.Anish\n  3.Juan\n  ...\n  15.Nami\n\n` +
+                `Bibs tracker:\n` +
+                `• To record last session's washer: include the word "bibs" anywhere on their line (e.g., "Amrit (bibs) 8" or "Amrit bibs 8").\n` +
+                `• "bibs_history" shows how many times each person has washed.`
               );
               continue;
             }
-            continue; // unknown button id
+            continue;
           }
 
-          // --- Plain text messages ---
           if (type === 'text') {
             const bodyText = (msg.text?.body || '').trim();
+
+            // Idempotency key for this inbound message (WhatsApp retries sometimes)
+            const msgId = msg.id || `${from}:${Date.now()}`;
+            const canRecordBibs = !processedMessageIds.has(msgId);
+
+
+            if (/^bibs[_\s-]?history$/i.test(bodyText)) {
+              const chart = renderBibsHistory();
+              await sendText(from, chart);
+              continue;
+            }
+
             const roster = parseRoster(bodyText);
+
+            // Record any bibs markers from this submission (who actually washed last time)
+            let bibsTakenNote = null;
+            if (canRecordBibs && roster.bibsTagged && roster.bibsTagged.length) {
+              const unique = Array.from(new Set(roster.bibsTagged));
+              const updates = unique.map(name => {
+                const newCount = incBibsCount(name);
+                return `${name} (${newCount})`;
+              });
+              bibsTakenNote = updates.join(', ');
+              processedMessageIds.add(msgId);
+            }
 
             if (roster.mode === 'snake') {
               if (roster.players.length !== 15) {
@@ -433,18 +503,21 @@ app.post('/webhook', async (req, res) => {
                 );
                 continue;
               }
-              const namesSorted = roster.players.map(p => p.name); // strong->weak
+              const namesSorted = roster.players.map(p => p.name);
               const ratingMap = new Map(roster.players.map((p) => [p.name, p.rating]));
-              // First reply: choose balanced composition already
               const choice = bestBalancedSnakeForOrder(namesSorted, ratingMap);
+              const bibsNext = pickBibsNext(namesSorted);
+
               lastRosterByUser.set(from, {
                 mode: 'snake',
-                players: roster.players.slice(), // keep ratings
+                players: roster.players.slice(),
                 lastKey: choice.key,
                 seenKeys: new Set([choice.key]),
+                bibsNext,
+                ratingMap
               });
               const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
-              await sendText(from, formatTeamsBlocks(choice.teams, totals));
+              await sendText(from, formatTeamsBlocks(choice.teams, totals, bibsNext, bibsTakenNote));
               await sendButtons(from);
               continue;
             }
@@ -458,16 +531,20 @@ app.post('/webhook', async (req, res) => {
                 continue;
               }
               const namesSorted = roster.players.slice();
-              const ratingMap = new Map(namesSorted.map((n, i) => [n, 15 - i])); // synthetic ratings
+              const ratingMap = new Map(namesSorted.map((n, i) => [n, 15 - i]));
               const choice = bestBalancedSnakeForOrder(namesSorted, ratingMap);
+              const bibsNext = pickBibsNext(namesSorted);
+
               lastRosterByUser.set(from, {
                 mode: 'snake_order',
                 players: namesSorted,
                 lastKey: choice.key,
                 seenKeys: new Set([choice.key]),
+                bibsNext,
+                ratingMap
               });
               const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
-              await sendText(from, formatTeamsBlocks(choice.teams, totals));
+              await sendText(from, formatTeamsBlocks(choice.teams, totals, bibsNext, bibsTakenNote));
               await sendButtons(from);
               continue;
             }
@@ -476,13 +553,16 @@ app.post('/webhook', async (req, res) => {
             const names = roster.players;
             if (names.length === 15) {
               const teams = makeTeamsRandom(names);
+              const bibsNext = pickBibsNext(names);
+
               lastRosterByUser.set(from, {
                 mode: 'random',
                 players: names.slice(),
                 lastKey: teamKey(teams),
                 seenKeys: new Set([teamKey(teams)]),
+                bibsNext
               });
-              await sendText(from, formatTeamsBlocks(teams));
+              await sendText(from, formatTeamsBlocks(teams, undefined, bibsNext, bibsTakenNote));
               await sendButtons(from);
             } else {
               const count = names.length;
@@ -493,13 +573,13 @@ app.post('/webhook', async (req, res) => {
                 `${hint}Examples:\n` +
                 `• teams: Alice, Bob, Carlos, Diego, Eva, Faisal, Gita, Hasan, Irene, Jack, Kai, Luca, Mina, Noor, Omar\n` +
                 `• Snake (rated): snake: Rajesh 9, Anish 8, Juan 8, Kunal 7, 97 7, ...\n` +
-                `• Snake (ranked only):\n  snake:\n  1.Rajesh\n  2.Anish\n  3.Juan\n  ...\n  15.Nami`
+                `• Snake (ranked only):\n  snake:\n  1.Rajesh\n  2.Anish\n  3.Juan\n  ...\n  15.Nami\n\n` +
+                `To record last session's washer, put the word "bibs" anywhere on their line (e.g., "Amrit (bibs) 8" or "Amrit bibs 8").`
               );
             }
             continue;
           }
 
-          // Other message types (image, sticker, etc.) – gently ignore
           await sendText(from, 'Please send text with a 15-player list. 😊');
         }
       }
@@ -508,6 +588,40 @@ app.post('/webhook', async (req, res) => {
     console.error('Webhook handling error:', err?.response?.data || err);
   }
 });
+
+// ---------- Bibs helpers ----------
+function pickBibsNext(currentNames) {
+  // Among current 15, choose least bibs count; tie → random among ties,
+  // but avoid repeating the last recorded washer if there is another candidate.
+  let min = Infinity;
+  const buckets = new Map();
+  for (const n of currentNames) {
+    const c = getBibsCount(n);
+    if (c < min) min = c;
+    const arr = buckets.get(c) || [];
+    arr.push(n);
+    buckets.set(c, arr);
+  }
+  let candidates = buckets.get(min) || currentNames;
+  const lastWasherKey = getLastWasherKey();
+  const filtered = candidates.filter(n => normalizeNameKey(n) !== lastWasherKey);
+  if (filtered.length) candidates = filtered;
+  const idx = Math.floor(Math.random() * candidates.length);
+  return candidates[idx];
+}
+
+function renderBibsHistory() {
+  const entries = getBibsEntries()
+    .filter(([_, count]) => (count || 0) > 0)
+    .sort((a,b) => a[1] - b[1]);
+  if (!entries.length) return 'No bibs history yet.';
+
+  const lines = entries.map(([key, count]) => {
+    const bar = '▮'.repeat(Math.min(20, count));
+    return `${key} — ${count} ${bar}`;
+  });
+  return `Bibs history (who has washed):\n` + lines.join('\n');
+}
 
 // ---------- Start ----------
 const PORT = process.env.PORT || 3000;
