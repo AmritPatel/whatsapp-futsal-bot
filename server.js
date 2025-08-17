@@ -129,17 +129,22 @@ function parseRoster(raw) {
 
   let forcedSnake = false;
 
-  // Accept "snake:" or "snake draft:" prefixes
-  const snakePrefix = text.match(/^snake(?:\s*draft)?\s*:\s*(.+)$/i);
+  // Accept "snake:" or "snake draft:" prefixes (multiline capture)
+  const snakePrefix = text.match(/^snake(?:\s*draft)?\s*:\s*([\s\S]+)$/i);
   if (snakePrefix) {
     forcedSnake = true;
     text = snakePrefix[1];
   }
 
-  // Case A: "teams: a, b, c, ..." (still may carry ratings if user chooses)
-  const teamsColon = text.match(/^teams?\s*:\s*(.+)$/i);
+  // Case A: "teams: a, b, c, ..." (also allow multiline after colon)
+  const teamsColon = text.match(/^teams?\s*:\s*([\s\S]+)$/i);
   if (teamsColon) {
-    const items = teamsColon[1].split(',').map(s => s.trim()).filter(Boolean);
+    const payload = teamsColon[1];
+    // split by comma first; if only one item, fall back to newline split
+    let items = payload.split(',').map(s => s.trim()).filter(Boolean);
+    if (items.length === 1) {
+      items = payload.split('\n').map(s => s.trim()).filter(Boolean);
+    }
     return buildRosterFromItems(items, forcedSnake);
   }
 
