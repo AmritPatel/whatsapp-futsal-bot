@@ -1,21 +1,17 @@
 // server.js
-// WhatsApp Futsal Bot — 3x5 team balancer + snake draft + Bibs tracker
+// WhatsApp Futsal Bot — 3x5 team balancer + snake draft + Bibs tracker + Tutorial with language detection
 // Features:
 // - random mode, snake (rated or ranked)
 // - vertical color blocks + buttons
 // - balanced initial snake + non-repeating balanced shuffles (tier/tie shuffling)
 // - team rating totals toggle via SHOW_TOTALS env (with decimal support)
 // - Decimal ratings supported (e.g., 7.5 or 7,5)
-// - Bibs tracker:
-//     * Mark who actually took bibs last session by adding the word "bibs" anywhere on their line
-//     * Track counts across sessions in a local JSON file (BIBS_FILE or ./bibs.json)
-//     * On team post, show "Bibs next: <least so far among the 15> (tie→random; avoids repeating last washer)"
-//     * Command "bibs_history" prints compact frequency chart (only people who have taken bibs)
-//     * Idempotent recording (no double count on webhook retries)
-//     * Only increments when the washer CHANGES from the last recorded washer
+// - Bibs tracker with idempotent & anti-repeat logic
+// - First-time tutorial & Help, with simple language detection (en/es/ne) and manual override via "lang en|es|ne"
+// - TEAM_LIST_ORDER env to control within-team display order (random|alpha|pick)
 //
 // Env required: VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
-// Optional: GRAPH_API_VERSION (defaults to v21.0), PORT, SHOW_TOTALS (default '1' → show), BIBS_FILE
+// Optional: GRAPH_API_VERSION (defaults to v21.0), PORT, SHOW_TOTALS (default '1' → show), BIBS_FILE, TEAM_LIST_ORDER
 
 const express = require('express');
 const axios = require('axios');
@@ -31,6 +27,7 @@ const PHONE_NUMBER_ID   = process.env.PHONE_NUMBER_ID;
 const WHATSAPP_TOKEN    = process.env.WHATSAPP_TOKEN;
 const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
 const SHOW_TOTALS       = (process.env.SHOW_TOTALS ?? '1') === '1';
+const TEAM_LIST_ORDER   = (process.env.TEAM_LIST_ORDER || 'random').toLowerCase();
 
 if (!PHONE_NUMBER_ID || !WHATSAPP_TOKEN || !VERIFY_TOKEN) {
   console.warn('[WARN] Missing one or more env vars: PHONE_NUMBER_ID, WHATSAPP_TOKEN, VERIFY_TOKEN');
@@ -41,6 +38,10 @@ const AUTH   = { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } };
 
 // Idempotency: avoid double-incrementing bibs on webhook retries
 const processedMessageIds = new Set();
+
+// Memory: first-time tutorial + language preference
+const shownTutorialUsers = new Set();          // phone-number → shown?
+const userLangPref = new Map();                // phone-number → 'en'|'es'|'ne'
 
 // ---------- Tiny memory for "Shuffle again" ----------
 /**
@@ -111,22 +112,48 @@ function getLastWasherKey() {
 }
 
 // ---------- Helpers: team formatting ----------
-const COLORS = [
-  { name: 'YELLOW', emoji: '🟡' }, // Team A
-  { name: 'BLUE',   emoji: '🔵' }, // Team B
-  { name: 'RED',    emoji: '🔴' }, // Team C
-];
+const EMOJIS = ['🟡','🔵','🔴'];
+const COLOR_NAMES = {
+  en: ['YELLOW','BLUE','RED'],
+  es: ['AMARILLO','AZUL','ROJO'],
+  ne: ['पहेंलो','नीलो','रातो']
+};
 
-function formatTeamsBlocks(teams, totals, bibsNext, bibsTakenNote) {
+
+// ---------- Display helpers ----------
+function capWord(w) {
+  if (!w) return w;
+  return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+}
+function titleCaseName(name) {
+  if (!name) return name;
+  // Title-case by spaces and hyphens, leave other punctuation intact
+  return name.split(' ').map(part =>
+    part.split('-').map(capWord).join('-')
+  ).join(' ');
+}
+function formatTeamsBlocks(teams, totals, bibsNext, bibsTakenNote, lang = 'en') {
   // teams = [ [5 names], [5 names], [5 names] ]
   const fmt = (x) => (Number.isFinite(x) ? (Number.isInteger(x) ? String(x) : x.toFixed(1)) : '');
+  const orderWithinTeam = (arr) => {
+    if (TEAM_LIST_ORDER === 'alpha') return arr.slice().sort((a,b)=>a.localeCompare(b));
+    if (TEAM_LIST_ORDER === 'pick')  return arr.slice(); // keep pick order
+    // default: random per response to avoid implied ranking
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
   const blocks = teams.map((t, i) => {
-    const header = `${COLORS[i].emoji}  ${COLORS[i].name}`;
-    const body   = t.map(n => `• ${n}`).join('\n');
+    const names = COLOR_NAMES[lang] || COLOR_NAMES.en;
+    const header = `${EMOJIS[i]}  ${names[i]}`;
+    const body   = orderWithinTeam(t).map(n => `• ${titleCaseName(n)}`).join('\n');
     const tail   = Array.isArray(totals) ? `\nTotal: ${fmt(totals[i])}` : '';
     return `${header}\n${body}${tail}`;
   });
-  const bibsLine = bibsNext ? `\n🧼 Bibs next: ${bibsNext}` : '';
+  const bibsLine = bibsNext ? `\n🧼 Bibs next: ${titleCaseName(bibsNext)}` : '';
   const takenLine = bibsTakenNote ? `\n✅ Recorded: ${bibsTakenNote}` : '';
   return `Teams for tonight:\n\n${blocks.join('\n\n')}${bibsLine}${takenLine}\n\nHave fun! ⚽`;
 }
@@ -137,6 +164,143 @@ function teamKey(teams) {
     .map(t => t.slice().sort((a,b)=>a.localeCompare(b)).join('|'));
   teamStrings.sort();
   return teamStrings.join('||');
+}
+
+// ---------- Language detection & tutorial ----------
+function detectLanguage(text) {
+  if (!text) return 'en';
+  // Strong signal: Devanagari block => Nepali
+  if (/[\\u0900-\\u097F]/.test(text)) return 'ne';
+  // Simple Spanish stopword heuristic
+  const sp = new Set(['y','de','del','el','la','los','las','para','por','con','un','una','que','al','en','tu','su','mis','sus']);
+  const en = new Set(['the','and','for','with','to','of','a','in','on','your','my']);
+  const tokens = text.toLowerCase().split(/[^a-záéíóúñü]+/).filter(Boolean);
+  let spCount=0, enCount=0;
+  for (const t of tokens) {
+    if (sp.has(t)) spCount++;
+    if (en.has(t)) enCount++;
+  }
+  if (spCount >= 3 && spCount > enCount) return 'es';
+  return 'en';
+}
+
+function tutorialText(lang='en') {
+  if (lang === 'es') {
+    return (
+`👋 ¿Primera vez? Dos formas comunes de usarme:
+
+1) 3 equipos de 5 al azar
+Envía exactamente 15 nombres, por ejemplo:
+teams: Rajesh, Anish, Juan, Kunal, Nami, Ashutosh, Apoorva, Andreas, Elias, Anjal, Saugat, Simon, Kevin, Amrit, Ashutosh+1
+
+(También puedes pegar 15 líneas; lo detecto igual.)
+
+2) Snake draft equilibrado (3×5)
+Añade una calificación al final de cada línea (se permiten decimales) y, opcionalmente, pon 'bibs' en quien lavó la vez anterior:
+
+snake:
+1. Rajesh (bibs) 7
+2. Anish 7
+3. Juan 7
+4. Kunal 7
+5. Nami 7
+6. Ashutosh 7
+7. Apoorva 7
+8. Andreas 7
+9. Elias 7
+10. Anjal 7
+11. Saugat 7
+12. Simon 7
+13. Kevin 7
+14. Amrit 7
+15. Ashutosh+1 7
+
+Notas:
+• Los números son ejemplos: ajústalos para equilibrar equipos. Decimales como 7.5 funcionan.
+• Escribe 'bibs' en la línea de quien realmente lavó la última vez para registrarlo.
+• Escribe 'bibs_history' para ver quiénes han lavado.
+• Pulsa 'Shuffle again' para más variaciones.
+
+Comando de idioma: "lang en", "lang es", "lang ne".`
+    );
+  }
+  if (lang === 'ne') {
+    return (
+`👋 पहिलोपटक? प्रयोग गर्ने दुई सामान्य तरिका:
+
+1) ३ वटा टिम (हरेकमा ५)
+ठ्याक्कै १५ जनाका नाम पठाउनुहोस्, जस्तै:
+teams: Rajesh, Anish, Juan, Kunal, Nami, Ashutosh, Apoorva, Andreas, Elias, Anjal, Saugat, Simon, Kevin, Amrit, Ashutosh+1
+
+(१५ वटा अलग–अलग लाइनमा पनि पठाउन सक्नुहुन्छ — म पहिचान गर्छु।)
+
+2) सन्तुलित snake draft (३×५)
+हरेक लाइनको अन्त्यमा रेटिङ लेख्नुहोस् (दशमलव मान्य), र अघिल्लो खेपमा बिब्स लगेर धुने व्यक्तिको लाइनमा 'bibs' राख्नुहोस्:
+
+snake:
+1. Rajesh (bibs) 7
+2. Anish 7
+3. Juan 7
+4. Kunal 7
+5. Nami 7
+6. Ashutosh 7
+7. Apoorva 7
+8. Andreas 7
+9. Elias 7
+10. Anjal 7
+11. Saugat 7
+12. Simon 7
+13. Kevin 7
+14. Amrit 7
+15. Ashutosh+1 7
+
+नोट:
+• यी नम्बरहरू उदाहरण हुन् — समतुल्य टिमका लागि मिलाउनुहोस्। 7.5 जस्ता दशमलव पनि ठीक।
+• 'bibs' राखेर अघिल्लो पटक वास्तवमै धुने व्यक्तिलाई रेकर्ड गर्नुहोस्।
+• 'bibs_history' टाइप गर्दा धुने इतिहास देखिन्छ।
+• थप भेरिएसनका लागि 'Shuffle again' थिच्नुहोस्।
+
+भाषा परिवर्तन: "lang en", "lang es", "lang ne".`
+    );
+  }
+  // default EN
+  return (
+`👋 First time here? Here are the two common ways to use me:
+
+1) Random 3 teams of 5
+Send exactly 15 names, e.g.
+teams: Rajesh, Anish, Juan, Kunal, Nami, Ashutosh, Apoorva, Andreas, Elias, Anjal, Saugat, Simon, Kevin, Amrit, Ashutosh+1
+
+(You can also paste 15 lines; I'll detect names either way.)
+
+2) Balanced snake draft (3×5)
+Include a rating at the end of each line (decimals OK), and optionally add 'bibs' on the person who washed last time:
+
+snake:
+1. Rajesh (bibs) 7
+2. Anish 7
+3. Juan 7
+4. Kunal 7
+5. Nami 7
+6. Ashutosh 7
+7. Apoorva 7
+8. Andreas 7
+9. Elias 7
+10. Anjal 7
+11. Saugat 7
+12. Simon 7
+13. Kevin 7
+14. Amrit 7
+15. Ashutosh+1 7
+
+Notes:
+• The numbers are sample ratings—tweak them to balance teams. Decimals like 7.5 work.
+• Put the word 'bibs' anywhere on a player's line to record who actually washed last time.
+• Type 'bibs_history' to see who has washed so far.
+• Tap 'Shuffle again' for more variations.
+
+Change language with: "lang en", "lang es", or "lang ne".`
+  );
 }
 
 // ---------- Helpers: sending ----------
@@ -411,12 +575,8 @@ app.post('/webhook', async (req, res) => {
             if (clicked === 'shuffle') {
               const prior = lastRosterByUser.get(from);
               if (!prior) {
-                await sendText(from,
-                  `I don't have a saved 15-player roster yet.\n\nSend:\n` +
-                  `teams: Alice, Bob, … (15 names)\n—or— paste your signup list.\n\n` +
-                  `For snake: "snake: Rajesh 9.0, Anish 8.5, …" or "snake:" with ranked lines.\n` +
-                  `Add the word "bibs" on the line of whoever washed last time to record it.`
-                );
+                const lang = userLangPref.get(from) || 'en';
+                await sendText(from, tutorialText(lang));
                 continue;
               }
 
@@ -426,7 +586,7 @@ app.post('/webhook', async (req, res) => {
                 prior.seenKeys = prior.seenKeys || new Set([prior.lastKey]);
                 prior.seenKeys.add(prior.lastKey);
                 lastRosterByUser.set(from, prior);
-                await sendText(from, formatTeamsBlocks(teams, undefined, prior.bibsNext, null));
+                await sendText(from, formatTeamsBlocks(teams, undefined, prior.bibsNext, null, (userLangPref.get(from) || 'en')));
                 await sendButtons(from);
                 continue;
               }
@@ -452,7 +612,7 @@ app.post('/webhook', async (req, res) => {
               prior.seenKeys.add(choice.key);
               lastRosterByUser.set(from, prior);
               const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
-              await sendText(from, formatTeamsBlocks(choice.teams, totals, prior.bibsNext, null));
+              await sendText(from, formatTeamsBlocks(choice.teams, totals, prior.bibsNext, null, (userLangPref.get(from) || 'en')));
               await sendButtons(from);
               continue;
             }
@@ -464,16 +624,8 @@ app.post('/webhook', async (req, res) => {
             }
 
             if (clicked === 'help') {
-              await sendText(from,
-                `Send exactly 15 players. Examples:\n\n` +
-                `• Random: teams: Alice, Bob, Carlos, Diego, Eva, Faisal, Gita, Hasan, Irene, Jack, Kai, Luca, Mina, Noor, Omar\n` +
-                `• Rated snake (no parentheses; decimals allowed): snake: Rajesh 9.0, Anish 8.5, Juan 8, Kunal 7, 97 7, Sam 7, ...\n` +
-                `• Ranked snake (no ratings, order strongest→weakest):\n` +
-                `  snake:\n  1.Rajesh\n  2.Anish\n  3.Juan\n  ...\n  15.Nami\n\n` +
-                `Bibs tracker:\n` +
-                `• To record last session's washer: include the word "bibs" anywhere on their line (e.g., "Amrit (bibs) 8" or "Amrit bibs 8").\n` +
-                `• "bibs_history" shows how many times each person has washed.`
-              );
+              const lang = userLangPref.get(from) || 'en';
+              await sendText(from, tutorialText(lang));
               continue;
             }
             continue; // unknown button id
@@ -483,6 +635,19 @@ app.post('/webhook', async (req, res) => {
           if (type === 'text') {
             const bodyText = (msg.text?.body || '').trim();
 
+            // Language override command
+            const langMatch = bodyText.match(/^lang\s+(en|es|ne)\b/i);
+            if (langMatch) {
+              const lang = langMatch[1].toLowerCase();
+              userLangPref.set(from, lang);
+              await sendText(from, {
+                en: 'Language set!',
+                es: 'Idioma actualizado.',
+                ne: 'भाषा परिवर्तन भयो।'
+              }[lang] || 'Language set!');
+              continue;
+            }
+
             // Quick command: bibs_history
             if (/^bibs[_\s-]?history$/i.test(bodyText)) {
               const chart = renderBibsHistory();
@@ -490,11 +655,30 @@ app.post('/webhook', async (req, res) => {
               continue;
             }
 
+            // Tutorial command
+            if (/^tutorial$/i.test(bodyText)) {
+              const lang = userLangPref.get(from) || detectLanguage(bodyText) || 'en';
+              userLangPref.set(from, lang);
+              shownTutorialUsers.add(from);
+              await sendText(from, tutorialText(lang));
+              continue;
+            }
+
             // Idempotency key for this inbound message (WhatsApp may retry)
             const msgId = msg.id || `${from}:${Date.now()}`;
             const canRecordBibs = !processedMessageIds.has(msgId);
 
-            const roster = parseRoster(bodyText);
+            // First-time tutorial if not 15 names yet
+            const probe = parseRoster(bodyText);
+            if (!shownTutorialUsers.has(from) && !(probe.players && probe.players.length === 15) && !/^bibs[_\s-]?history$/i.test(bodyText)) {
+              const lang = userLangPref.get(from) || detectLanguage(bodyText) || 'en';
+              userLangPref.set(from, lang);
+              shownTutorialUsers.add(from);
+              await sendText(from, tutorialText(lang));
+              continue;
+            }
+
+            const roster = probe;
 
             // Record any bibs markers from this submission (who actually washed last time)
             let bibsTakenNote = null;
@@ -502,7 +686,7 @@ app.post('/webhook', async (req, res) => {
               const unique = Array.from(new Set(roster.bibsTagged));
               const updates = unique.map(name => {
                 const newCount = incBibsCount(name);
-                return `${name} (${newCount})`;
+                return `${titleCaseName(name)} (${newCount})`;
               });
               bibsTakenNote = updates.join(', ');
               processedMessageIds.add(msgId);
@@ -510,37 +694,50 @@ app.post('/webhook', async (req, res) => {
 
             if (roster.mode === 'snake') {
               if (roster.players.length !== 15) {
+                const lang = userLangPref.get(from) || 'en';
                 await sendText(from,
-                  `For rated snake draft, send exactly 15 names each with a rating (no parentheses; decimals OK).\n\n` +
+                  lang === 'es' ?
+                  `Para snake con calificaciones, envía exactamente 15 nombres con una nota al final (decimales OK).\n\n` +
+                  `Ejemplo:\nsnake: Rajesh 9.0, Anish 8.5, Juan 8, Kunal 7, 97 7, Sam 7, Pranab 6.5, Andreas 6, Elias 6, Anjal 6, Saugat 5, Simon 5, Kevin 5, Amrit 4.5, Nami 3`
+                  : lang === 'ne' ?
+                  `Rated snake को लागि, १५ वटा नाम चाहिन्छ, प्रत्येक लाइनको अन्त्यमा रेटिङ (दशमलव पनि ठीक)।\n\n` +
+                  `उदाहरण:\nsnake: Rajesh 9.0, Anish 8.5, Juan 8, Kunal 7, 97 7, Sam 7, Pranab 6.5, Andreas 6, Elias 6, Anjal 6, Saugat 5, Simon 5, Kevin 5, Amrit 4.5, Nami 3`
+                  :
+                  `For rated snake draft, send exactly 15 names each with a rating (decimals OK).\n\n` +
                   `Example:\nsnake: Rajesh 9.0, Anish 8.5, Juan 8, Kunal 7, 97 7, Sam 7, Pranab 6.5, Andreas 6, Elias 6, Anjal 6, Saugat 5, Simon 5, Kevin 5, Amrit 4.5, Nami 3`
                 );
                 continue;
               }
               const namesSorted = roster.players.map(p => p.name); // strong->weak
               const ratingMap = new Map(roster.players.map((p) => [p.name, p.rating]));
-              // First reply: choose balanced composition already
               const choice = bestBalancedSnakeForOrder(namesSorted, ratingMap);
-
-              // Compute bibs next (least count among these 15; ties random; avoid last washer)
               const bibsNext = pickBibsNext(namesSorted);
 
               lastRosterByUser.set(from, {
                 mode: 'snake',
-                players: roster.players.slice(), // keep ratings
+                players: roster.players.slice(),
                 lastKey: choice.key,
                 seenKeys: new Set([choice.key]),
                 bibsNext,
                 ratingMap
               });
               const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
-              await sendText(from, formatTeamsBlocks(choice.teams, totals, bibsNext, bibsTakenNote));
+              await sendText(from, formatTeamsBlocks(choice.teams, totals, bibsNext, bibsTakenNote, (userLangPref.get(from) || 'en')));
               await sendButtons(from);
               continue;
             }
 
             if (roster.mode === 'snake_order') {
               if (roster.players.length !== 15) {
+                const lang = userLangPref.get(from) || 'en';
                 await sendText(from,
+                  lang === 'es' ?
+                  `Para snake sin calificaciones, envía 15 nombres en orden de fuerte→débil después de "snake:".\n\n` +
+                  `Ejemplo:\nsnake:\n1.Rajesh\n2.Anish\n3.Juan\n4.Kunal\n5.97\n6.Sam\n7.Pranab\n8.Andreas\n9.Elias\n10.Anjal\n11.Saugat\n12.Simon\n13.Kevin\n14.Amrit\n15.Nami`
+                  : lang === 'ne' ?
+                  `Snake (रेटिङ बिना) को लागि, "snake:" पछाडि १५ वटा नाम मजबूत→कमजोर क्रममा पठाउनुहोस्।\n\n` +
+                  `उदाहरण:\nsnake:\n1.Rajesh\n2.Anish\n3.Juan\n4.Kunal\n5.97\n6.Sam\n7.Pranab\n8.Andreas\n9.Elias\n10.Anjal\n11.Saugat\n12.Simon\n13.Kevin\n14.Amrit\n15.Nami`
+                  :
                   `For ranked snake (no ratings), send exactly 15 names in strongest→weakest order after "snake:".\n\n` +
                   `Example:\nsnake:\n1.Rajesh\n2.Anish\n3.Juan\n4.Kunal\n5.97\n6.Sam\n7.Pranab\n8.Andreas\n9.Elias\n10.Anjal\n11.Saugat\n12.Simon\n13.Kevin\n14.Amrit\n15.Nami`
                 );
@@ -549,8 +746,6 @@ app.post('/webhook', async (req, res) => {
               const namesSorted = roster.players.slice();
               const ratingMap = new Map(namesSorted.map((n, i) => [n, 15 - i])); // synthetic ratings
               const choice = bestBalancedSnakeForOrder(namesSorted, ratingMap);
-
-              // Compute bibs next
               const bibsNext = pickBibsNext(namesSorted);
 
               lastRosterByUser.set(from, {
@@ -562,7 +757,7 @@ app.post('/webhook', async (req, res) => {
                 ratingMap
               });
               const totals = SHOW_TOTALS ? computeTeamSums(choice.teams, ratingMap) : undefined;
-              await sendText(from, formatTeamsBlocks(choice.teams, totals, bibsNext, bibsTakenNote));
+              await sendText(from, formatTeamsBlocks(choice.teams, totals, bibsNext, bibsTakenNote, (userLangPref.get(from) || 'en')));
               await sendButtons(from);
               continue;
             }
@@ -571,8 +766,6 @@ app.post('/webhook', async (req, res) => {
             const names = roster.players;
             if (names.length === 15) {
               const teams = makeTeamsRandom(names);
-
-              // Compute bibs next
               const bibsNext = pickBibsNext(names);
 
               lastRosterByUser.set(from, {
@@ -582,19 +775,19 @@ app.post('/webhook', async (req, res) => {
                 seenKeys: new Set([teamKey(teams)]),
                 bibsNext
               });
-              await sendText(from, formatTeamsBlocks(teams, undefined, bibsNext, bibsTakenNote));
+              await sendText(from, formatTeamsBlocks(teams, undefined, bibsNext, bibsTakenNote, (userLangPref.get(from) || 'en')));
               await sendButtons(from);
             } else {
               const count = names.length;
+              const lang = userLangPref.get(from) || detectLanguage(bodyText) || 'en';
+              userLangPref.set(from, lang);
               const hint = count
-                ? `I found ${count} name${count === 1 ? '' : 's'}. I need exactly 15.\n\n`
+                ? (lang === 'es' ? `Encontré ${count} nombre(s). Necesito exactamente 15.\n\n` :
+                   lang === 'ne' ? `मैले ${count} वटा नाम फेला पारेँ। ठ्याक्कै १५ चाहिन्छ।\n\n` :
+                   `I found ${count} name(s). I need exactly 15.\n\n`)
                 : '';
               await sendText(from,
-                `${hint}Examples:\n` +
-                `• teams: Alice, Bob, Carlos, Diego, Eva, Faisal, Gita, Hasan, Irene, Jack, Kai, Luca, Mina, Noor, Omar\n` +
-                `• Snake (rated): snake: Rajesh 9.0, Anish 8.5, Juan 8, Kunal 7, 97 7, ...\n` +
-                `• Snake (ranked only):\n  snake:\n  1.Rajesh\n  2.Anish\n  3.Juan\n  ...\n  15.Nami\n\n` +
-                `To record last session's washer, put the word "bibs" anywhere on their line (e.g., "Amrit (bibs) 8" or "Amrit bibs 8").`
+                hint + tutorialText(lang)
               );
             }
             continue;
@@ -639,7 +832,7 @@ function renderBibsHistory() {
 
   const lines = entries.map(([key, count]) => {
     const bar = '▮'.repeat(Math.min(20, count));
-    return `${key} — ${count} ${bar}`;
+    return `${titleCaseName(key)} — ${count} ${bar}`;
   });
   return `Bibs history (who has washed):\n` + lines.join('\n');
 }
